@@ -1,0 +1,127 @@
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.10.3-python3.11
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth"
+    PYTHONPATH: /opt/airflow
+    WAREHOUSE_HOST: warehouse
+    WAREHOUSE_PORT: 5432
+    WAREHOUSE_DB: ${POSTGRES_DB}
+    WAREHOUSE_USER: ${POSTGRES_USER}
+    WAREHOUSE_PASSWORD: ${POSTGRES_PASSWORD}
+    OPEN_METEO_URL: ${OPEN_METEO_URL}
+    COINGECKO_URL: ${COINGECKO_URL}
+    REST_COUNTRIES_URL: ${REST_COUNTRIES_URL}
+    _PIP_ADDITIONAL_REQUIREMENTS: "requests==2.32.3 pandas==2.2.3 psycopg2-binary==2.9.10 python-dotenv==1.0.1"
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./etl:/opt/airflow/etl
+    - ./sql:/opt/airflow/sql
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    airflow-db:
+      condition: service_healthy
+
+services:
+  # ─────────────────────────────────────────────────────────────
+  # Data Warehouse (PostgreSQL)
+  # This is where our ETL pipelines load data for analytics.
+  # ─────────────────────────────────────────────────────────────
+  warehouse:
+    image: postgres:16
+    container_name: etl_warehouse
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - warehouse_data:/var/lib/postgresql/data
+      - ./sql/schema:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────────────────────────
+  # Airflow Metadata Database (PostgreSQL)
+  # Airflow uses this internally to track DAGs, tasks, and runs.
+  # Kept separate from the warehouse for clean separation.
+  # ─────────────────────────────────────────────────────────────
+  airflow-db:
+    image: postgres:16
+    container_name: etl_airflow_db
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────────────────────────
+  # Airflow Initializer (runs once)
+  # Sets up the metadata DB schema and creates the admin user.
+  # ─────────────────────────────────────────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    container_name: etl_airflow_init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username ${AIRFLOW_ADMIN_USER} \
+          --password ${AIRFLOW_ADMIN_PASSWORD} \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com || true
+    restart: "no"
+
+  # ─────────────────────────────────────────────────────────────
+  # Airflow Scheduler
+  # Watches DAG files and triggers task execution on schedule.
+  # ─────────────────────────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: etl_airflow_scheduler
+    command: scheduler
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ─────────────────────────────────────────────────────────────
+  # Airflow Webserver (UI)
+  # Browse to http://localhost:8080 to see your pipelines.
+  # ─────────────────────────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: etl_airflow_webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  warehouse_data:
+  airflow_db_data:

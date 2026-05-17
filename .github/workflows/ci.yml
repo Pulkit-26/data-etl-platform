@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ────────────────────────────────────────────────────────
+  # Lint & format: fast checks that run on every commit
+  # ────────────────────────────────────────────────────────
+  lint:
+    name: Lint & format (Ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Ruff
+        run: pip install ruff==0.8.4
+
+      - name: Ruff lint
+        run: ruff check etl dags tests
+
+      - name: Ruff format check
+        run: ruff format --check etl dags tests
+
+  # ────────────────────────────────────────────────────────
+  # Unit tests with mocked HTTP — no network, no DB needed
+  # ────────────────────────────────────────────────────────
+  test:
+    name: Unit tests (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pytest
+        run: pytest tests/test_extractors.py
+
+  # ────────────────────────────────────────────────────────
+  # DAG validation: import every DAG file to catch syntax /
+  # import errors before they break the scheduler.
+  # ────────────────────────────────────────────────────────
+  validate-dags:
+    name: Validate Airflow DAGs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Airflow + project deps
+        run: |
+          python -m pip install --upgrade pip
+          # Airflow has a constraints file pinning compatible versions
+          AIRFLOW_VERSION=2.10.3
+          PYTHON_VERSION="$(python --version | cut -d ' ' -f 2 | cut -d '.' -f 1-2)"
+          CONSTRAINT="https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
+          pip install "apache-airflow==${AIRFLOW_VERSION}" --constraint "${CONSTRAINT}"
+          pip install requests pandas psycopg2-binary python-dotenv
+
+      - name: Set Airflow home & disable example DAGs
+        run: |
+          echo "AIRFLOW_HOME=$HOME/airflow" >> $GITHUB_ENV
+          echo "AIRFLOW__CORE__LOAD_EXAMPLES=false" >> $GITHUB_ENV
+          echo "PYTHONPATH=$PWD" >> $GITHUB_ENV
+
+      - name: Initialize Airflow DB
+        run: airflow db migrate
+
+      - name: Import-check every DAG file
+        run: |
+          for dag in dags/*.py; do
+            echo "Importing $dag..."
+            python -c "import importlib.util; \
+              spec = importlib.util.spec_from_file_location('dag', '$dag'); \
+              mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)"
+          done
+
+      - name: Run airflow dags list
+        run: airflow dags list
+
+  # ────────────────────────────────────────────────────────
+  # Docker compose sanity: ensure the compose file is valid
+  # ────────────────────────────────────────────────────────
+  validate-compose:
+    name: Validate docker-compose.yml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Copy env template
+        run: cp .env.example .env
+      - name: Validate compose syntax
+        run: docker compose config --quiet
