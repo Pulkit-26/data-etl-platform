@@ -39,7 +39,6 @@ DEFAULT_ARGS = {
     doc_md=__doc__,
 )
 def crypto_pipeline():
-
     @task(task_id="extract_and_load_staging")
     def extract_and_load() -> int:
         api_cfg = load_api_config()
